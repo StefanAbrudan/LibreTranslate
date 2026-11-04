@@ -22,7 +22,7 @@ from werkzeug.exceptions import HTTPException
 from werkzeug.http import http_date
 from werkzeug.utils import secure_filename
 
-from libretranslate import flood, remove_translated_files, scheduler, secret, security, storage, cache
+from libretranslate import flood, glossary, remove_translated_files, scheduler, secret, security, storage, cache
 from libretranslate.language import model2iso, iso2model, detect_languages, improve_translation_formatting, get_language_with_fallback
 from libretranslate.locales import (
     _,
@@ -197,6 +197,7 @@ def create_app(args):
 
     storage.setup(args.shared_storage)
     trans_cache = cache.setup(args.translation_cache)
+    default_glossary = glossary.load_file(args.glossary_file) if args.glossary_file else []
 
     if not args.disable_files_translation:
         remove_translated_files.setup(get_upload_dir())
@@ -626,6 +627,17 @@ def create_app(args):
             required: false
             description: Preferred number of alternative translations
           - in: formData
+            name: glossary
+            schema:
+              type: array
+              items:
+                type: string
+              example: ['Acme Corp']
+            required: false
+            description: >
+              Terms to leave untranslated, matched as whole words ignoring case.
+              Added to the server's default glossary, if any.
+          - in: formData
             name: api_key
             schema:
               type: string
@@ -683,6 +695,17 @@ def create_app(args):
                         items:
                           type: string
                   description: Alternative translations
+                glossaryMissing:
+                  oneOf:
+                    - type: array
+                      items:
+                        type: string
+                    - type: array
+                      items:
+                        type: array
+                        items:
+                          type: string
+                  description: Glossary terms lost during translation, only present when there are any
               required:
                 - translatedText
           400:
@@ -729,12 +752,14 @@ def create_app(args):
             target_lang = iso2model(json.get("target"))
             text_format = json.get("format")
             num_alternatives = int(json.get("alternatives", 0))
+            request_glossary = json.get("glossary")
         else:
             q = request.values.get("q")
             source_lang = iso2model(request.values.get("source"))
             target_lang = iso2model(request.values.get("target"))
             text_format = request.values.get("format")
             num_alternatives = request.values.get("alternatives", 0)
+            request_glossary = request.values.getlist("glossary")
 
         if not q:
             abort(400, description=_("Invalid request: missing %(name)s parameter", name='q'))
@@ -750,6 +775,11 @@ def create_app(args):
 
         if args.alternatives_limit != -1 and num_alternatives > args.alternatives_limit:
             abort(400, description=_("Invalid request: %(name)s parameter must be <= %(value)s", name='alternatives', value=args.alternatives_limit))
+
+        try:
+            glossary_terms = glossary.merge_terms(default_glossary, request_glossary)
+        except ValueError as e:
+            abort(400, description=_("Invalid request: %(name)s parameter is not valid", name='glossary') + f" ({e})")
 
         if not request.is_json:
             # Normalize line endings to UNIX style (LF) only so we can consistently
@@ -774,7 +804,7 @@ def create_app(args):
         ak = get_req_api_key()
         cache_key = None
         if trans_cache.should_check(ak):
-          cache_key, hit = trans_cache.hit(src_texts, source_lang, target_lang, text_format, num_alternatives)
+          cache_key, hit = trans_cache.hit(src_texts, source_lang, target_lang, text_format, num_alternatives, glossary_terms)
           if hit is not None:
             return Response(hit, status=200, mimetype="application/json")
 
@@ -816,29 +846,37 @@ def create_app(args):
         if text_format not in ["text", "html"]:
             abort(400, description=_("%(format)s format is not supported", format=text_format))
 
+        glossary_re = glossary.compile_terms(glossary_terms, text_format)
+
         try:
             if batch:
                 batch_results = []
                 batch_alternatives = []
+                batch_missing = []
                 for text in q:
                     translator = src_lang.get_translation(tgt_lang)
                     if translator is None:
                         abort(400, description=_("%(tname)s (%(tcode)s) is not available as a target language from %(sname)s (%(scode)s)", tname=_lazy(tgt_lang.name), tcode=tgt_lang.code, sname=_lazy(src_lang.name), scode=src_lang.code))
 
                     if translatable:
+                      masked, terms = glossary.protect(text, glossary_re, text_format)
                       if text_format == "html":
-                          translated_text = unescape(str(translate_html(translator, text)))
+                          translated_text = unescape(str(translate_html(translator, masked)))
                           alternatives = [] # Not supported for html yet
                       else:
-                          hypotheses = translator.hypotheses(text, num_alternatives + 1)
-                          translated_text = unescape(improve_translation_formatting(text, hypotheses[0].value))
-                          alternatives = filter_unique([unescape(improve_translation_formatting(text, hypotheses[i].value)) for i in range(1, len(hypotheses))], translated_text)
+                          hypotheses = translator.hypotheses(masked, num_alternatives + 1)
+                          translated_text = unescape(improve_translation_formatting(masked, hypotheses[0].value))
+                          alternatives = filter_unique([unescape(improve_translation_formatting(masked, hypotheses[i].value)) for i in range(1, len(hypotheses))], translated_text)
+                      translated_text, missing = glossary.restore(translated_text, terms)
+                      alternatives = [glossary.restore(alt, terms)[0] for alt in alternatives]
                     else:
                       translated_text = text # Cannot translate, send the original text back
                       alternatives = []
+                      missing = []
 
                     batch_results.append(translated_text)
                     batch_alternatives.append(alternatives)
+                    batch_missing.append(missing)
 
                 result = {"translatedText": batch_results}
 
@@ -846,22 +884,28 @@ def create_app(args):
                     result["detectedLanguage"] = [model2iso(detected_src_lang)] * len(q)
                 if num_alternatives > 0:
                     result["alternatives"] = batch_alternatives
+                if any(batch_missing):
+                    result["glossaryMissing"] = batch_missing
             else:
                 translator = src_lang.get_translation(tgt_lang)
                 if translator is None:
                     abort(400, description=_("%(tname)s (%(tcode)s) is not available as a target language from %(sname)s (%(scode)s)", tname=_lazy(tgt_lang.name), tcode=tgt_lang.code, sname=_lazy(src_lang.name), scode=src_lang.code))
 
                 if translatable:
+                  masked, terms = glossary.protect(q, glossary_re, text_format)
                   if text_format == "html":
-                      translated_text = unescape(str(translate_html(translator, q)))
+                      translated_text = unescape(str(translate_html(translator, masked)))
                       alternatives = [] # Not supported for html yet
                   else:
-                      hypotheses = translator.hypotheses(q, num_alternatives + 1)
-                      translated_text = unescape(improve_translation_formatting(q, hypotheses[0].value))
-                      alternatives = filter_unique([unescape(improve_translation_formatting(q, hypotheses[i].value)) for i in range(1, len(hypotheses))], translated_text)
+                      hypotheses = translator.hypotheses(masked, num_alternatives + 1)
+                      translated_text = unescape(improve_translation_formatting(masked, hypotheses[0].value))
+                      alternatives = filter_unique([unescape(improve_translation_formatting(masked, hypotheses[i].value)) for i in range(1, len(hypotheses))], translated_text)
+                  translated_text, missing = glossary.restore(translated_text, terms)
+                  alternatives = [glossary.restore(alt, terms)[0] for alt in alternatives]
                 else:
                   translated_text = q # Cannot translate, send the original text back
                   alternatives = []
+                  missing = []
 
                 result = {"translatedText": translated_text}
 
@@ -869,6 +913,8 @@ def create_app(args):
                     result["detectedLanguage"] = model2iso(detected_src_lang)
                 if num_alternatives > 0:
                     result["alternatives"] = alternatives
+                if missing:
+                    result["glossaryMissing"] = missing
             
             if cache_key is not None:
               trans_cache.cache(cache_key, result)

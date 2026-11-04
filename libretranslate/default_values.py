@@ -242,6 +242,11 @@ _default_options_objects = [
         'value_type': 'str'
     },
     {
+        'name': 'GLOSSARY_FILE',
+        'default_value': '',
+        'value_type': 'str'
+    },
+    {
         'name': 'URL_PREFIX',
         'default_value': '',
         'value_type': 'str'

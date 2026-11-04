@@ -195,6 +195,13 @@ def get_parser():
         help="Set available languages (ar,de,en,es,fr,ga,hi,it,ja,ko,pt,ru,zh)",
     )
     parser.add_argument(
+        "--glossary-file",
+        type=str,
+        default=DEFARGS['GLOSSARY_FILE'],
+        metavar="<path>",
+        help="Set a file of terms that /translate never translates, one per line, # starts a comment (%(default)s)",
+    )
+    parser.add_argument(
         "--alternatives-limit",
         default=DEFARGS['ALTERNATIVES_LIMIT'],
         type=int,
